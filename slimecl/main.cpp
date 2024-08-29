@@ -10,10 +10,6 @@
 #include "imgui_impl_opengl3.h"
 
 
-#define MAP_WIDTH 1024
-#define MAP_HEIGHT 1024
-#define NUM_SLIMES 100000
-
 GLFWwindow* window;
 
 Device gpu;
@@ -22,12 +18,15 @@ Kernel k_decayTrails, k_updateSlimes;
 Memory<float> positions, directions;
 Memory<float>* trailMap, *nextTrailMap;
 Memory<float> colouredTrail;
+Memory<uint> randomSeeds;
 
 GLuint trailMapTexture;
 
-
-float simDeltaTime = 0.1f; //time step to use each frame
-float elapsedTime = 0.0f;
+int mapWidth;
+int mapHeight;
+int numSlimes;
+float simDeltaTime; //time step to use each frame
+bool simRunning;
 
 std::chrono::high_resolution_clock::time_point prevFrameEnd;
 float prevFrameDuration;
@@ -39,6 +38,7 @@ struct SlimeSettings
 	float sensorAngle;
 	float sensorTurnStrength;
 	float directionRandomness;
+	int depositWidth;
 } slimeSettings;
 
 struct TrailSettings
@@ -49,10 +49,48 @@ struct TrailSettings
 } trailSettings;
 
 
+bool initSim();
+bool destroySim();
+
 void drawMenu()
 {
 	ImGui::Begin("Settings");
 	ImGui::SeparatorText("Simulation Settings");
+
+	if (!simRunning)
+	{
+		if (ImGui::Button("Start Simulation"))
+		{
+			if (initSim()) simRunning = true;
+		}
+
+		if (ImGui::InputInt("Map Width", &mapWidth))
+		{
+			mapWidth = std::min(std::max(mapWidth, 10), 10000);
+		}
+
+		if (ImGui::InputInt("Map Height", &mapHeight))
+		{
+			mapHeight = std::min(std::max(mapHeight, 10), 10000);
+		}
+
+		if (ImGui::InputInt("Number of Slimes", &numSlimes))
+		{
+			numSlimes = std::min(std::max(numSlimes, 1), (int)1e6);
+		}
+	}
+	else
+	{
+		if (ImGui::Button("Stop Simulation"))
+		{
+			destroySim();
+		}
+
+		ImGui::LabelText("Map Width", std::to_string(mapWidth).c_str());
+		ImGui::LabelText("Map Height", std::to_string(mapHeight).c_str());
+		ImGui::LabelText("NUmber of Slimes", std::to_string(numSlimes).c_str());
+	}
+
 	ImGui::DragFloat("Sim Delta Time", &simDeltaTime, 0.001f, 0.001f, 10.0f, "%.3f s", ImGuiSliderFlags_AlwaysClamp);
 
 	ImGui::SeparatorText("Slime Settings");
@@ -61,6 +99,7 @@ void drawMenu()
 	ImGui::SliderAngle("Sensor Angle", &slimeSettings.sensorAngle, 10.0f, 90.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
 	ImGui::SliderFloat("Sensor Turn Strengh", &slimeSettings.sensorTurnStrength, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	ImGui::SliderFloat("Direction Randomness", &slimeSettings.directionRandomness, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	ImGui::SliderInt("Deposit Width", &slimeSettings.depositWidth, 0, 5, "%d", ImGuiSliderFlags_AlwaysClamp);
 
 	ImGui::SeparatorText("Trail Settings");
 	ImGui::SliderFloat("Blur Rate", &trailSettings.blurRate, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -86,10 +125,8 @@ void drawTrails()
 	ImGui::End();
 }
 
-bool init()
+bool initOnce()
 {
-	srand(std::chrono::system_clock::now().time_since_epoch().count());
-
 	//set up GLFW and glad
 	glfwInit();
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
@@ -112,6 +149,7 @@ bool init()
 		return false;
 	}
 
+
 	//set up ImGUI
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
@@ -120,19 +158,54 @@ bool init()
 	ImGui::GetStyle().ScaleAllSizes(2.0f); //make things more readable at high screen res
 
 
-	//set up OpenCL device, kernels and memory
+	//set default parameters
+	//want to remember parameters between simulation resets, so only init once
+	mapWidth = 1024;
+	mapHeight = 1024;
+	numSlimes = 1000;
+	simDeltaTime = 0.1f; //time step to use each frame
+	simRunning = false;
+
+	slimeSettings.slimeSpeed = 5.0f; //number of pixels per 1 second of sim time
+	slimeSettings.sensorRadius = 2; //size in pixels of sensor box width in each direction from centre (e.g. sensorRadius = 2, box is 5x5)
+	slimeSettings.sensorAngle = pi * 0.25f; //angle from direction of slime to left/right sensors
+	slimeSettings.sensorTurnStrength = 0.3f; //how strongly the slime turns towards the strongest sensor
+	slimeSettings.directionRandomness = 0.1f; //how much randomness changes the slime's direction
+	slimeSettings.depositWidth = 0; //how many pixels each side of the slime to leave a trail on
+
+	trailSettings.blurRate = 0.2f;
+	trailSettings.decayRate = 0.005f;
+	trailSettings.r = 0.2f;
+	trailSettings.g = 1.0f;
+	trailSettings.b = 0.6f;
+
+
 	//gpu = Device(select_device_with_most_flops());
 	gpu = Device(select_device_with_id(1));
-	k_decayTrails = Kernel(gpu, MAP_WIDTH * MAP_HEIGHT, "decayTrails");
-	k_updateSlimes = Kernel(gpu, NUM_SLIMES, "updateSlimes");
 
-	positions = Memory<float>(gpu, NUM_SLIMES, 2);
-	directions = Memory<float>(gpu, NUM_SLIMES, 2);
-	trailMap = new Memory<float>(gpu, MAP_WIDTH * MAP_HEIGHT);
-	nextTrailMap = new Memory<float>(gpu, MAP_WIDTH * MAP_HEIGHT);
-	colouredTrail = Memory<float>(gpu, MAP_WIDTH * MAP_HEIGHT, 4);
+	//set up texture for displaying trailMap
+	glGenTextures(1, &trailMapTexture);
+	glBindTexture(GL_TEXTURE_2D, trailMapTexture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-	for (int i = 0; i < MAP_WIDTH * MAP_HEIGHT; i++)
+	return true;
+}
+
+bool initSim()
+{
+	int mapSize = mapWidth * mapHeight;
+	positions = Memory<float>(gpu, numSlimes, 2);
+	directions = Memory<float>(gpu, numSlimes, 2);
+	trailMap = new Memory<float>(gpu, mapSize);
+	nextTrailMap = new Memory<float>(gpu, mapSize);
+	colouredTrail = Memory<float>(gpu, mapSize, 4);
+	randomSeeds = Memory<uint>(gpu, numSlimes);
+
+	k_decayTrails = Kernel(gpu, mapSize, "decayTrails");
+	k_updateSlimes = Kernel(gpu, numSlimes, "updateSlimes");
+
+	for (int i = 0; i < mapSize; i++)
 	{
 		(*trailMap)[i] = 0.0f;
 		(*nextTrailMap)[i] = 0.0f;
@@ -141,39 +214,24 @@ bool init()
 	(*trailMap).write_to_device();
 	(*nextTrailMap).write_to_device();
 
-	for (int i = 0; i < NUM_SLIMES; i++)
+	for (int i = 0; i < numSlimes; i++)
 	{
-		positions.x[i] = (float)(rand() % MAP_WIDTH);
-		positions.y[i] = (float)(rand() % MAP_HEIGHT);
+		positions.x[i] = rand() % mapWidth;
+		positions.y[i] = rand() % mapHeight;
 
 		float dx = (float)rand() / RAND_MAX - 0.5f;
 		float dy = (float)rand() / RAND_MAX - 0.5f;
 		float l = sqrtf(dx * dx + dy * dy);
 		directions.x[i] = dx / l;
 		directions.y[i] = dy / l;
+
+		randomSeeds[i] = rand();
 	}
 
 	positions.write_to_device();
 	directions.write_to_device();
+	randomSeeds.write_to_device();
 
-	slimeSettings.slimeSpeed = 5.0f; //number of pixels per 1 second of sim time
-	slimeSettings.sensorRadius = 2; //size in pixels of sensor box width in each direction from centre (e.g. sensorRadius = 2, box is 5x5)
-	slimeSettings.sensorAngle = pi * 0.25f; //angle from direction of slime to left/right sensors
-	slimeSettings.sensorTurnStrength = 0.3f; //how strongly the slime turns towards the strongest sensor
-	slimeSettings.directionRandomness = 0.1f; //how much randomness changes the slime's direction
-
-	trailSettings.blurRate = 0.2f;
-	trailSettings.decayRate = 0.005f;
-	trailSettings.r = 0.2f;
-	trailSettings.g = 0.6f;
-	trailSettings.b = 1.0f;
-
-
-	//set up texture for displaying trailMap
-	glGenTextures(1, &trailMapTexture);
-	glBindTexture(GL_TEXTURE_2D, trailMapTexture);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
 	//frame timing
 	prevFrameEnd = std::chrono::high_resolution_clock::now();
@@ -188,22 +246,24 @@ bool update()
 	ImGui_ImplGlfw_NewFrame();
 	ImGui::NewFrame();
 
-	k_decayTrails.set_parameters(0, *trailMap, *nextTrailMap, colouredTrail, MAP_WIDTH, MAP_HEIGHT, simDeltaTime,
-		trailSettings).run();
-	
-	k_updateSlimes.set_parameters(0, positions, directions, *trailMap, *nextTrailMap, MAP_WIDTH,
-		MAP_HEIGHT, simDeltaTime, elapsedTime, slimeSettings).run();
-	
-	std::swap(trailMap, nextTrailMap);
+	if (simRunning)
+	{
+		k_decayTrails.set_parameters(0, *trailMap, *nextTrailMap, colouredTrail, mapWidth, mapHeight, simDeltaTime,
+			trailSettings).run();
 
-	//copy updated trail back from device (to then send back to the device in the texture...)
-	colouredTrail.read_from_device();
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, MAP_WIDTH, MAP_HEIGHT, 0, GL_RGBA, GL_FLOAT, colouredTrail.data());
+		k_updateSlimes.set_parameters(0, positions, directions, *trailMap, *nextTrailMap, randomSeeds, mapWidth,
+			mapHeight, simDeltaTime, slimeSettings, numSlimes).run();
+
+		std::swap(trailMap, nextTrailMap);
+
+		//copy updated trail back from device (to then send back to the device in the texture...)
+		colouredTrail.read_from_device();
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, mapWidth, mapHeight, 0, GL_RGBA, GL_FLOAT, colouredTrail.data());
+		
+		drawTrails();
+	}
 	
 	drawMenu();
-	drawTrails();
-
-	elapsedTime += simDeltaTime;
 
 	ImGui::Render();
 	ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -215,10 +275,18 @@ bool update()
 	return true;
 }
 
-bool destroy()
+bool destroySim()
 {
+	simRunning = false;
 	delete trailMap;
 	delete nextTrailMap;
+
+	return true;
+}
+
+bool destroy()
+{
+	if (simRunning) destroySim();
 
 	ImGui_ImplOpenGL3_Shutdown();
 	ImGui_ImplGlfw_Shutdown();
@@ -229,10 +297,11 @@ bool destroy()
 	return true;
 }
 
-
 int main()
 {
-	if (!init())
+	srand(std::chrono::system_clock::now().time_since_epoch().count());
+
+	if (!initOnce())
 	{
 		std::cout << "Error during initialisation, exiting" << std::endl;
 		return -1;
