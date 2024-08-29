@@ -119,8 +119,24 @@ void drawTrails()
 {	
 	ImGui::Begin("Trail Map");
 	ImGui::LabelText("", ("Frame time: " + std::to_string(prevFrameDuration) + "ms").c_str());
-	ImGui::BeginChild("trailtexture");
-	ImGui::Image((void*)(intptr_t)trailMapTexture, ImGui::GetWindowSize(), ImVec2(0, 1), ImVec2(1, 0));
+	ImGui::BeginChild("trailimage");
+
+	//make the image sit nicely in the window with the correct aspect ratio
+	ImVec2 windowSize = ImGui::GetWindowSize();
+	float windowHeightPerWidth = windowSize.y / windowSize.x;
+	float mapHeightPerWidth = (float)mapHeight / mapWidth;
+	ImVec2 displayedImageSize;
+	if (windowHeightPerWidth > mapHeightPerWidth)
+	{
+		//window is more vertical than image, so fill horizontally
+		displayedImageSize = { windowSize.x, windowSize.x * mapHeightPerWidth };
+	}
+	else
+	{
+		//window is more horizontal than image, so fill vertically
+		displayedImageSize = { windowSize.y / mapHeightPerWidth, windowSize.y };
+	}
+	ImGui::Image((void*)(intptr_t)trailMapTexture, displayedImageSize, ImVec2(0, 1), ImVec2(1, 0));
 	ImGui::EndChild();
 	ImGui::End();
 }
